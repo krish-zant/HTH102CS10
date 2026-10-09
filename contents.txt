@@ -1,0 +1,2738 @@
+main.py:
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional
+from backend.auth import authenticate
+
+from backend.database import initialize_database, get_incidents, get_incident
+from backend.pipeline import process_event, verify_incident_integrity
+
+
+app = FastAPI(
+    title="Signal-Fused SOC API",
+    description="Signal-Fused Intrusion Detection and Response Prioritization API",
+    version="1.0.0",
+)
+
+@app.on_event("startup")
+def startup():
+    initialize_database()
+
+
+class SecurityEvent(BaseModel):
+    timestamp: str
+    source_type: str
+    source_ip: str
+    destination_ip: Optional[str] = None
+    username: Optional[str] = None
+    event_type: str
+    severity: Optional[str] = None
+    asset_criticality: Optional[str] = None
+    message: Optional[str] = None
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+@app.get("/")
+def root():
+    return {
+        "name": "Signal-Fused SOC API",
+        "status": "running",
+        "version": "1.0.0",
+    }
+
+
+@app.post("/api/events")
+def create_event(event: SecurityEvent):
+    try:
+        result = process_event(event.model_dump())
+
+        return {
+            "status": "success",
+            "result": result,
+        }
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        )
+
+
+@app.get("/api/incidents")
+def list_incidents():
+    try:
+        incidents = get_incidents()
+
+        return {
+            "count": len(incidents),
+            "incidents": incidents,
+        }
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=500,
+            detail=str(error),
+        )
+
+
+@app.get("/api/incidents/{incident_id}")
+def incident_details(incident_id: str):
+    incident = get_incident(incident_id)
+
+    if not incident:
+        raise HTTPException(
+            status_code=404,
+            detail="Incident not found",
+        )
+
+    return incident
+
+@app.get("/api/dashboard/summary")
+def dashboard_summary():
+    incidents = get_incidents()
+
+    severity_counts = {
+        "CRITICAL": 0,
+        "HIGH": 0,
+        "MEDIUM": 0,
+        "LOW": 0,
+    }
+
+    priority_counts = {
+        "P1": 0,
+        "P2": 0,
+        "P3": 0,
+        "P4": 0,
+    }
+
+    integrity_counts = {
+        "VERIFIED": 0,
+        "TAMPERED": 0,
+        "OTHER": 0,
+    }
+
+    for incident in incidents:
+
+        severity = incident.get("severity")
+        if severity in severity_counts:
+            severity_counts[severity] += 1
+
+        priority = incident.get("priority_level")
+        if priority in priority_counts:
+            priority_counts[priority] += 1
+
+        integrity = incident.get("integrity_status")
+
+        if integrity == "INTEGRITY_VERIFIED":
+            integrity_counts["VERIFIED"] += 1
+        elif integrity == "TAMPERING_DETECTED":
+            integrity_counts["TAMPERED"] += 1
+        else:
+            integrity_counts["OTHER"] += 1
+
+    return {
+        "total_incidents": len(incidents),
+        "severity": severity_counts,
+        "priority": priority_counts,
+        "integrity": integrity_counts,
+    }
+
+@app.get("/api/trust/{incident_id}/verify")
+def verify_trust(incident_id: str):
+
+    incident = get_incident(incident_id)
+
+    if not incident:
+        raise HTTPException(
+            status_code=404,
+            detail="Incident not found",
+        )
+
+    return verify_incident_integrity(incident_id)
+
+@app.post("/api/auth/login")
+def analyst_login(request: LoginRequest):
+
+    authenticated, analyst = authenticate(
+        request.username,
+        request.password
+    )
+
+    if not authenticated:
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid username or password"
+        )
+
+    return {
+        "authenticated": True,
+        "analyst": analyst
+    }
+Pipeline.py:
+import hashlib
+import json
+import uuid
+
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+from backend.database import (
+    get_connection,
+    save_event,
+    save_incident,
+    get_incident,
+)
+
+
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+CORRELATION_WINDOW_SECONDS = 300
+ANALYST_CAPACITY = 10
+
+
+
+
+def generate_id(prefix):
+    return f"{prefix}-{uuid.uuid4().hex[:10].upper()}"
+
+
+def parse_timestamp(timestamp):
+    if not timestamp:
+        return datetime.now(timezone.utc)
+
+    value = timestamp.replace("Z", "+00:00")
+
+    parsed = datetime.fromisoformat(value)
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed
+
+
+def normalize_timestamp(timestamp):
+    return parse_timestamp(timestamp).isoformat()
+
+
+SIGNAL_RULES = {
+    "FAILED_LOGIN": ("AUTH_FAILURE_SIGNAL", 0.70),
+    "AUTH_FAILURE": ("AUTH_FAILURE_SIGNAL", 0.70),
+
+    "BRUTE_FORCE": ("BRUTE_FORCE_SIGNAL", 0.90),
+
+    "CONNECTION_FAILURE": ("CONNECTION_FAILURE_SIGNAL", 0.60),
+
+    "CONNECTION_ATTEMPT": ("CONNECTION_ATTEMPT_SIGNAL", 0.55),
+
+    "PORT_SCAN": ("PORT_SCAN_SIGNAL", 0.85),
+
+    "SCAN": ("SCAN_EVENT_SIGNAL", 0.70),
+
+    "TRAFFIC_SPIKE": ("TRAFFIC_SPIKE_SIGNAL", 0.75),
+
+    "LARGE_TRANSFER": ("LARGE_TRANSFER_SIGNAL", 0.75),
+
+    "FIREWALL_DENY": ("FIREWALL_DENY_SIGNAL", 0.70),
+
+    "IDS_ALERT": ("IDS_ALERT_SIGNAL", 0.80),
+
+    "SENSITIVE_FILE_ACCESS": (
+        "SENSITIVE_FILE_ACCESS_SIGNAL",
+        0.90,
+    ),
+}
+
+def detect_signals(event):
+    signals = []
+
+    event_type = str(event.get("event_type", "")).upper()
+
+    if event_type in SIGNAL_RULES:
+        signal_type, strength = SIGNAL_RULES[event_type]
+
+        signals.append({
+            "signal_id": generate_id("SIG"),
+            "signal_type": signal_type,
+            "signal_strength": strength,
+            "event_id": event["event_id"],
+        })
+
+    severity = str(event.get("severity", "")).upper()
+
+    if severity == "HIGH":
+        signals.append({
+            "signal_id": generate_id("SIG"),
+            "signal_type": "HIGH_SEVERITY_SIGNAL",
+            "signal_strength": 0.60,
+            "event_id": event["event_id"],
+        })
+
+    elif severity == "CRITICAL":
+        signals.append({
+            "signal_id": generate_id("SIG"),
+            "signal_type": "HIGH_SEVERITY_SIGNAL",
+            "signal_strength": 0.90,
+            "event_id": event["event_id"],
+        })
+
+    return signals
+
+
+def get_recent_events(event):
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    current_time = parse_timestamp(event["timestamp"])
+
+    lower_time = current_time - timedelta(
+        seconds=CORRELATION_WINDOW_SECONDS
+    )
+
+    upper_time = current_time + timedelta(
+        seconds=CORRELATION_WINDOW_SECONDS
+    )
+
+    cursor.execute("""
+        SELECT *
+        FROM events
+        WHERE timestamp >= ?
+          AND timestamp <= ?
+        ORDER BY timestamp ASC
+    """, (
+        lower_time.isoformat(),
+        upper_time.isoformat(),
+    ))
+
+    rows = cursor.fetchall()
+
+    connection.close()
+
+    recent_events = []
+
+    for row in rows:
+        item = dict(row)
+
+        same_source_ip = (
+            event.get("source_ip")
+            and item.get("source_ip")
+            and event["source_ip"] == item["source_ip"]
+        )
+
+        same_destination_ip = (
+            event.get("destination_ip")
+            and item.get("destination_ip")
+            and event["destination_ip"] == item["destination_ip"]
+        )
+
+        same_username = (
+            event.get("username")
+            and item.get("username")
+            and event["username"] == item["username"]
+        )
+
+        if (
+            same_source_ip
+            or same_destination_ip
+            or same_username
+        ):
+            recent_events.append(item)
+
+    return recent_events
+
+def fuse_signals(events_with_signals):
+
+    all_signals = []
+
+    source_types = set()
+
+    for item in events_with_signals:
+        event = item["event"]
+
+        source_type = event.get("source_type")
+
+        if source_type:
+            source_types.add(source_type)
+
+        for signal in item["signals"]:
+            all_signals.append(signal)
+
+    signal_types = sorted(
+        set(
+            signal["signal_type"]
+            for signal in all_signals
+        )
+    )
+
+    source_types = sorted(source_types)
+
+    signal_count = len(all_signals)
+    event_count = len(events_with_signals)
+
+    if all_signals:
+        strengths = [
+            signal["signal_strength"]
+            for signal in all_signals
+        ]
+
+        mean_signal_strength = (
+            sum(strengths) / len(strengths)
+        )
+
+        max_signal_strength = max(strengths)
+
+    else:
+        mean_signal_strength = 0.0
+        max_signal_strength = 0.0
+
+    cross_source_evidence = len(source_types) >= 2
+
+    multi_event_evidence = event_count >= 2
+
+    high_severity_context = (
+        "HIGH_SEVERITY_SIGNAL" in signal_types
+    )
+
+    patterns = []
+
+
+
+    if (
+        "AUTH_FAILURE_SIGNAL" in signal_types
+        or "BRUTE_FORCE_SIGNAL" in signal_types
+    ):
+        patterns.append("CREDENTIAL_ATTACK")
+
+
+    if (
+        "PORT_SCAN_SIGNAL" in signal_types
+        or "SCAN_EVENT_SIGNAL" in signal_types
+    ):
+        patterns.append("RECON_SCANNING")
+
+
+
+    network_signals = {
+        "CONNECTION_FAILURE_SIGNAL",
+        "CONNECTION_ATTEMPT_SIGNAL",
+        "FIREWALL_DENY_SIGNAL",
+        "IDS_ALERT_SIGNAL",
+    }
+
+    if network_signals.intersection(signal_types):
+        patterns.append("NETWORK_ACCESS_ANOMALY")
+
+    if "TRAFFIC_SPIKE_SIGNAL" in signal_types:
+        patterns.append("TRAFFIC_ANOMALY")
+
+
+    if (
+        "SENSITIVE_FILE_ACCESS_SIGNAL" in signal_types
+        or "LARGE_TRANSFER_SIGNAL" in signal_types
+    ):
+        patterns.append("DATA_ACCESS_MOVEMENT")
+
+
+    credential_present = (
+        "AUTH_FAILURE_SIGNAL" in signal_types
+        or "BRUTE_FORCE_SIGNAL" in signal_types
+    )
+
+    data_access_present = (
+        "SENSITIVE_FILE_ACCESS_SIGNAL" in signal_types
+        or "LARGE_TRANSFER_SIGNAL" in signal_types
+    )
+
+    if credential_present and data_access_present:
+        patterns.append("CREDENTIAL_TO_ACCESS_CHAIN")
+
+
+    if not patterns:
+        if signal_count == 1:
+            patterns.append("SINGLE_SIGNAL")
+        else:
+            patterns.append("NO_DEFINED_PATTERN")
+
+
+
+    if len(patterns) > 1:
+        incident_type = "MULTI_PATTERN_SECURITY_ACTIVITY"
+    else:
+        incident_type = patterns[0]
+
+
+    fusion_strength = mean_signal_strength
+
+    if cross_source_evidence:
+        fusion_strength += 0.10
+
+    if multi_event_evidence:
+        fusion_strength += 0.10
+
+    fusion_strength = min(
+        round(fusion_strength, 4),
+        1.0,
+    )
+
+    return {
+        "incident_type": incident_type,
+        "patterns": patterns,
+        "signal_types": signal_types,
+        "source_types": source_types,
+        "signal_count": signal_count,
+        "event_count": event_count,
+        "fusion_strength": fusion_strength,
+        "mean_signal_strength": round(
+            mean_signal_strength,
+            4,
+        ),
+        "max_signal_strength": round(
+            max_signal_strength,
+            4,
+        ),
+        "cross_source_evidence": cross_source_evidence,
+        "multi_event_evidence": multi_event_evidence,
+        "high_severity_context": high_severity_context,
+    }
+
+
+# ============================================================
+# STAGE 5 — INCIDENT CREATION / UPDATE
+# ============================================================
+
+def find_existing_incident(events_with_signals):
+
+    if not events_with_signals:
+        return None
+
+    current_event = events_with_signals[-1]["event"]
+
+    source_ip = current_event.get("source_ip")
+    destination_ip = current_event.get("destination_ip")
+
+    current_time = parse_timestamp(
+        current_event["timestamp"]
+    )
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM incidents
+        ORDER BY incident_end DESC
+    """)
+
+    rows = cursor.fetchall()
+
+    connection.close()
+
+    best_match = None
+
+    for row in rows:
+
+        incident = dict(row)
+
+        if not incident.get("incident_end"):
+            continue
+
+        incident_end = parse_timestamp(
+            incident["incident_end"]
+        )
+
+        time_difference = abs(
+            (current_time - incident_end).total_seconds()
+        )
+
+        if time_difference > CORRELATION_WINDOW_SECONDS:
+            continue
+
+        same_source = (
+            source_ip
+            and incident.get("source_ip")
+            and source_ip == incident["source_ip"]
+        )
+
+        same_destination = (
+            destination_ip
+            and incident.get("destination_ip")
+            and destination_ip == incident["destination_ip"]
+        )
+
+        if same_source or same_destination:
+
+            if best_match is None:
+                best_match = incident
+            else:
+                best_end = parse_timestamp(
+                    best_match["incident_end"]
+                )
+
+                if incident_end > best_end:
+                    best_match = incident
+
+    return best_match
+
+
+def create_incident(
+    correlation_id,
+    events_with_signals,
+    fusion,
+    existing_incident=None,
+):
+
+    events = [
+        item["event"]
+        for item in events_with_signals
+    ]
+
+    timestamps = [
+        parse_timestamp(event["timestamp"])
+        for event in events
+    ]
+
+    incident_start = min(timestamps).isoformat()
+    incident_end = max(timestamps).isoformat()
+
+    source_ips = [
+        event.get("source_ip")
+        for event in events
+        if event.get("source_ip")
+    ]
+
+    destination_ips = [
+        event.get("destination_ip")
+        for event in events
+        if event.get("destination_ip")
+    ]
+
+    source_ip = (
+        source_ips[0]
+        if source_ips
+        else None
+    )
+
+    destination_ip = (
+        destination_ips[0]
+        if destination_ips
+        else None
+    )
+
+    if existing_incident:
+        incident_id = existing_incident["incident_id"]
+    else:
+        incident_id = generate_id("INC")
+
+    patterns_text = ", ".join(
+        fusion["patterns"]
+    )
+
+    signal_types_text = ", ".join(
+        fusion["signal_types"]
+    )
+
+    source_types_text = ", ".join(
+        fusion["source_types"]
+    )
+
+    if fusion["incident_type"] == "CREDENTIAL_ATTACK":
+        title = (
+            f"Credential Attack from {source_ip}"
+        )
+
+    elif fusion["incident_type"] == "RECON_SCANNING":
+        title = (
+            f"Reconnaissance Activity from {source_ip}"
+        )
+
+    elif fusion["incident_type"] == "DATA_ACCESS_MOVEMENT":
+        title = (
+            f"Data Access Activity from {source_ip}"
+        )
+
+    elif fusion["incident_type"] == "CREDENTIAL_TO_ACCESS_CHAIN":
+        title = (
+            f"Credential-to-Access Chain from {source_ip}"
+        )
+
+    elif fusion["incident_type"] == "MULTI_PATTERN_SECURITY_ACTIVITY":
+        title = (
+            f"Multi Pattern Security Activity from {source_ip}"
+        )
+
+    else:
+        title = (
+            f"{fusion['incident_type']} from {source_ip}"
+        )
+
+    return {
+        "incident_id": incident_id,
+        "correlation_id": correlation_id,
+        "incident_type": fusion["incident_type"],
+        "incident_patterns": patterns_text,
+        "incident_title": title,
+        "incident_start": incident_start,
+        "incident_end": incident_end,
+        "source_ip": source_ip,
+        "destination_ip": destination_ip,
+        "signal_types": signal_types_text,
+        "source_types": source_types_text,
+        "signal_count": fusion["signal_count"],
+        "unique_event_count": fusion["event_count"],
+        "fusion_strength": fusion["fusion_strength"],
+        "cross_source_evidence": fusion[
+            "cross_source_evidence"
+        ],
+        "multi_event_evidence": fusion[
+            "multi_event_evidence"
+        ],
+        "high_severity_context": fusion[
+            "high_severity_context"
+        ],
+        "incident_summary": (
+            f"{fusion['event_count']} correlated event(s) "
+            f"produced {fusion['signal_count']} security "
+            f"signal(s). Detected pattern: "
+            f"{patterns_text}."
+        ),
+    }
+
+
+# ============================================================
+# STAGE 6 — RISK ASSESSMENT
+# ============================================================
+
+def calculate_risk(incident, fusion):
+
+    fusion_strength_points = (
+        fusion["fusion_strength"] * 25
+    )
+
+    signal_count = fusion["signal_count"]
+
+    if signal_count <= 1:
+        signal_diversity_points = 3
+    elif signal_count == 2:
+        signal_diversity_points = 6
+    elif signal_count == 3:
+        signal_diversity_points = 9
+    elif signal_count == 4:
+        signal_diversity_points = 12
+    else:
+        signal_diversity_points = 15
+
+    source_count = len(
+        fusion["source_types"]
+    )
+
+    if source_count <= 1:
+        source_diversity_points = 3
+    elif source_count == 2:
+        source_diversity_points = 7
+    elif source_count == 3:
+        source_diversity_points = 10
+    elif source_count == 4:
+        source_diversity_points = 13
+    else:
+        source_diversity_points = 15
+
+    multi_event_points = (
+        10
+        if fusion["multi_event_evidence"]
+        else 0
+    )
+
+    cross_source_points = (
+        10
+        if fusion["cross_source_evidence"]
+        else 0
+    )
+
+    pattern_points_map = {
+        "CREDENTIAL_TO_ACCESS_CHAIN": 15,
+        "DATA_ACCESS_MOVEMENT": 14,
+        "CREDENTIAL_ATTACK": 12,
+        "RECON_SCANNING": 8,
+        "NETWORK_ACCESS_ANOMALY": 8,
+        "TRAFFIC_ANOMALY": 8,
+        "MULTI_PATTERN_SECURITY_ACTIVITY": 13,
+        "SINGLE_SIGNAL": 3,
+        "NO_DEFINED_PATTERN": 3,
+    }
+
+    pattern_points = 0
+
+    for pattern in fusion["patterns"]:
+        pattern_points = max(
+            pattern_points,
+            pattern_points_map.get(
+                pattern,
+                0,
+            ),
+        )
+
+    high_severity_points = (
+        10
+        if fusion["high_severity_context"]
+        else 0
+    )
+
+    risk_score = (
+        fusion_strength_points
+        + signal_diversity_points
+        + source_diversity_points
+        + multi_event_points
+        + cross_source_points
+        + pattern_points
+        + high_severity_points
+    )
+
+    risk_score = min(
+        round(risk_score, 2),
+        100.0,
+    )
+
+    if risk_score >= 75:
+        severity = "CRITICAL"
+    elif risk_score >= 50:
+        severity = "HIGH"
+    elif risk_score >= 25:
+        severity = "MEDIUM"
+    else:
+        severity = "LOW"
+
+    risk_factors = []
+
+    if fusion["multi_event_evidence"]:
+        risk_factors.append(
+            "multiple correlated events"
+        )
+
+    if fusion["cross_source_evidence"]:
+        risk_factors.append(
+            "cross-source evidence"
+        )
+
+    if fusion["high_severity_context"]:
+        risk_factors.append(
+            "high-severity context"
+        )
+
+    risk_factors.append(
+        "pattern: " + ", ".join(fusion["patterns"])
+    )
+
+    return {
+        "risk_score": risk_score,
+        "severity": severity,
+        "fusion_strength_points": round(
+            fusion_strength_points,
+            2,
+        ),
+        "signal_diversity_points":
+            signal_diversity_points,
+        "source_diversity_points":
+            source_diversity_points,
+        "multi_event_points":
+            multi_event_points,
+        "cross_source_points":
+            cross_source_points,
+        "incident_pattern_points":
+            pattern_points,
+        "high_severity_points":
+            high_severity_points,
+        "risk_factors":
+            "; ".join(risk_factors),
+    }
+
+
+# ============================================================
+# STAGE 7 — ANALYST PRIORITY
+# ============================================================
+
+def calculate_priority(incident, risk):
+
+    risk_component = (
+        risk["risk_score"] * 0.70
+    )
+
+    # No asset criticality is currently stored
+    # directly inside the simplified incident.
+    asset_criticality_points = 0
+
+    now = datetime.now(timezone.utc)
+
+    incident_end = parse_timestamp(
+        incident["incident_end"]
+    )
+
+    age_seconds = (
+        now - incident_end
+    ).total_seconds()
+
+    if age_seconds <= 300:
+        recency_points = 10
+    elif age_seconds <= 900:
+        recency_points = 7
+    elif age_seconds <= 3600:
+        recency_points = 4
+    else:
+        recency_points = 1
+
+    additional_context_points = 0
+
+    priority_score = (
+        risk_component
+        + asset_criticality_points
+        + recency_points
+        + additional_context_points
+    )
+
+    priority_score = min(
+        round(priority_score, 2),
+        100.0,
+    )
+
+    if (
+        priority_score >= 75
+        or (
+            risk["severity"] == "CRITICAL"
+            and risk["risk_score"] >= 75
+        )
+    ):
+        priority_level = "P1"
+        recommended_action = (
+            "IMMEDIATE_INVESTIGATION"
+        )
+
+    elif priority_score >= 50:
+        priority_level = "P2"
+        recommended_action = (
+            "INVESTIGATE_NEXT"
+        )
+
+    elif priority_score >= 25:
+        priority_level = "P3"
+        recommended_action = (
+            "NORMAL_INVESTIGATION"
+        )
+
+    else:
+        priority_level = "P4"
+        recommended_action = (
+            "MONITOR_AND_DEFER"
+        )
+
+    return {
+        "priority_score": priority_score,
+        "priority_level": priority_level,
+        "risk_component": round(
+            risk_component,
+            2,
+        ),
+        "asset_criticality_points":
+            asset_criticality_points,
+        "recency_points":
+            recency_points,
+        "additional_context_points":
+            additional_context_points,
+        "recommended_action":
+            recommended_action,
+        "priority_reason": (
+            f"Risk contribution="
+            f"{risk_component:.2f}; "
+            f"recency={recency_points}; "
+            f"asset criticality="
+            f"{asset_criticality_points}."
+        ),
+    }
+
+
+# ============================================================
+# QUEUE RANKING
+# ============================================================
+
+def update_queue_ranks():
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM incidents
+        ORDER BY
+            CASE priority_level
+                WHEN 'P1' THEN 1
+                WHEN 'P2' THEN 2
+                WHEN 'P3' THEN 3
+                WHEN 'P4' THEN 4
+                ELSE 5
+            END ASC,
+            priority_score DESC,
+            incident_end DESC
+    """)
+
+    rows = cursor.fetchall()
+
+    for index, row in enumerate(rows, start=1):
+
+        incident_id = row["incident_id"]
+
+        cursor.execute("""
+            UPDATE incidents
+            SET queue_rank = ?
+            WHERE incident_id = ?
+        """, (
+            index,
+            incident_id,
+        ))
+
+    connection.commit()
+    connection.close()
+
+
+# ============================================================
+# STAGE 8 — CRYPTOGRAPHIC TRUST
+# ============================================================
+
+def canonicalize_incident(
+    incident,
+    risk,
+    priority,
+):
+
+    canonical_data = {
+        "correlation_id":
+            incident["correlation_id"],
+
+        "cross_source_evidence":
+            incident["cross_source_evidence"],
+
+        "destination_ip":
+            incident["destination_ip"],
+
+        "fusion_strength":
+            incident["fusion_strength"],
+
+        "high_severity_context":
+            incident["high_severity_context"],
+
+        "incident_end":
+            incident["incident_end"],
+
+        "incident_id":
+            incident["incident_id"],
+
+        "incident_patterns":
+            incident["incident_patterns"],
+
+        "incident_start":
+            incident["incident_start"],
+
+        "incident_title":
+            incident["incident_title"],
+
+        "incident_type":
+            incident["incident_type"],
+
+        "multi_event_evidence":
+            incident["multi_event_evidence"],
+
+        "priority_level":
+            priority["priority_level"],
+
+        "priority_score":
+            priority["priority_score"],
+
+        "recommended_action":
+            priority["recommended_action"],
+
+        "risk_score":
+            risk["risk_score"],
+
+        "severity":
+            risk["severity"],
+
+        "signal_count":
+            incident["signal_count"],
+
+        "signal_types":
+            incident["signal_types"],
+
+        "source_ip":
+            incident["source_ip"],
+
+        "source_types":
+            incident["source_types"],
+
+        "unique_event_count":
+            incident["unique_event_count"],
+    }
+
+    return json.dumps(
+        canonical_data,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def generate_hash(canonical_evidence):
+
+    return hashlib.sha256(
+        canonical_evidence.encode("utf-8")
+    ).hexdigest()
+
+
+def verify_incident_integrity(incident_id):
+    incident = get_incident(incident_id)
+
+    if not incident:
+        return {
+            "incident_id": incident_id,
+            "integrity_status": "INCIDENT_NOT_FOUND",
+        }
+
+    stored_canonical = incident["canonical_evidence"]
+    stored_hash = incident["evidence_hash"]
+
+    calculated_hash = generate_hash(stored_canonical)
+
+    if calculated_hash == stored_hash:
+        integrity_status = "INTEGRITY_VERIFIED"
+    else:
+        integrity_status = "TAMPERING_DETECTED"
+
+    return {
+        "incident_id": incident_id,
+        "stored_hash": stored_hash,
+        "calculated_hash": calculated_hash,
+        "integrity_status": integrity_status,
+    }
+
+
+def process_event(event):
+
+    event = dict(event)
+
+    if not event.get("event_id"):
+        event["event_id"] = generate_id("EVT")
+
+    event["timestamp"] = normalize_timestamp(
+        event["timestamp"]
+    )
+
+
+    current_signals = detect_signals(event)
+
+
+
+    save_event(event)
+
+
+
+    recent_events = get_recent_events(event)
+
+    events_with_signals = []
+
+    for previous_event in recent_events:
+
+        previous_signals = detect_signals(
+            previous_event
+        )
+
+        events_with_signals.append({
+            "event": previous_event,
+            "signals": previous_signals,
+        })
+
+    # Make sure current event is included
+    current_event_already_present = any(
+        item["event"]["event_id"]
+        == event["event_id"]
+        for item in events_with_signals
+    )
+
+    if not current_event_already_present:
+        events_with_signals.append({
+            "event": event,
+            "signals": current_signals,
+        })
+
+    # Remove duplicate events
+    unique_events = {}
+
+    for item in events_with_signals:
+        unique_events[
+            item["event"]["event_id"]
+        ] = item
+
+    events_with_signals = list(
+        unique_events.values()
+    )
+
+    # Sort chronologically
+    events_with_signals.sort(
+        key=lambda item: parse_timestamp(
+            item["event"]["timestamp"]
+        )
+    )
+
+
+    fusion = fuse_signals(
+        events_with_signals
+    )
+
+
+    existing_incident = find_existing_incident(
+        events_with_signals
+    )
+
+    if existing_incident:
+        correlation_id = existing_incident[
+            "correlation_id"
+        ]
+    else:
+        correlation_id = generate_id("COR")
+
+    incident = create_incident(
+        correlation_id=correlation_id,
+        events_with_signals=events_with_signals,
+        fusion=fusion,
+        existing_incident=existing_incident,
+    )
+
+
+
+    risk = calculate_risk(
+        incident,
+        fusion,
+    )
+
+    incident["risk_score"] = risk[
+        "risk_score"
+    ]
+
+    incident["severity"] = risk[
+        "severity"
+    ]
+
+
+
+    priority = calculate_priority(
+        incident,
+        risk,
+    )
+
+    incident["priority_score"] = priority[
+        "priority_score"
+    ]
+
+    incident["priority_level"] = priority[
+        "priority_level"
+    ]
+
+    incident["recommended_action"] = priority[
+        "recommended_action"
+    ]
+
+    incident["queue_rank"] = 0
+
+
+    canonical_evidence = canonicalize_incident(
+        incident,
+        risk,
+        priority,
+    )
+
+    evidence_hash = generate_hash(
+        canonical_evidence
+    )
+
+    incident["canonical_evidence"] = (
+        canonical_evidence
+    )
+
+    incident["evidence_hash"] = evidence_hash
+
+    incident["integrity_status"] = "INITIALIZED"
+
+    # --------------------------------------------------------
+    # Save / update incident
+    # --------------------------------------------------------
+
+    save_incident(incident)
+
+    # --------------------------------------------------------
+    # Recalculate analyst queue
+    # --------------------------------------------------------
+
+    update_queue_ranks()
+
+    # --------------------------------------------------------
+    # Retrieve final queue rank
+    # --------------------------------------------------------
+
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT queue_rank
+        FROM incidents
+        WHERE incident_id = ?
+    """, (
+        incident["incident_id"],
+    ))
+
+    row = cursor.fetchone()
+
+    connection.close()
+
+    if row:
+        incident["queue_rank"] = row[
+            "queue_rank"
+        ]
+
+    # --------------------------------------------------------
+    # Return complete result
+    # --------------------------------------------------------
+
+    return {
+        "event": event,
+        "signals": current_signals,
+        "correlation_id": correlation_id,
+        "fusion": fusion,
+        "incident": incident,
+        "risk": risk,
+        "priority": priority,
+        "trust": {
+            "hash_algorithm": "SHA-256",
+            "evidence_hash": evidence_hash,
+            "integrity_status":
+                "INITIALIZED",
+        },
+    }
+
+database.py:
+import sqlite3
+from pathlib import Path
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DATA_DIR = BASE_DIR / "data"
+DB_PATH = DATA_DIR / "soc.db"
+
+
+def get_connection():
+    DATA_DIR.mkdir(exist_ok=True)
+
+    connection = sqlite3.connect(
+        DB_PATH,
+        check_same_thread=False
+    )
+
+    connection.row_factory = sqlite3.Row
+
+    return connection
+
+
+def initialize_database():
+    connection = get_connection()
+
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            event_id TEXT PRIMARY KEY,
+            timestamp TEXT,
+            source_type TEXT,
+            source_ip TEXT,
+            destination_ip TEXT,
+            username TEXT,
+            event_type TEXT,
+            severity TEXT,
+            asset_criticality TEXT,
+            message TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS incidents (
+            incident_id TEXT PRIMARY KEY,
+            correlation_id TEXT,
+            incident_type TEXT,
+            incident_patterns TEXT,
+            incident_title TEXT,
+            incident_start TEXT,
+            incident_end TEXT,
+            source_ip TEXT,
+            destination_ip TEXT,
+            signal_types TEXT,
+            source_types TEXT,
+            signal_count INTEGER,
+            unique_event_count INTEGER,
+            fusion_strength REAL,
+            risk_score REAL,
+            severity TEXT,
+            priority_score REAL,
+            priority_level TEXT,
+            queue_rank INTEGER,
+            recommended_action TEXT,
+            canonical_evidence TEXT,
+            evidence_hash TEXT,
+            integrity_status TEXT
+        )
+    """)
+
+    connection.commit()
+    connection.close()
+
+
+def save_event(event):
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO events (
+            event_id,
+            timestamp,
+            source_type,
+            source_ip,
+            destination_ip,
+            username,
+            event_type,
+            severity,
+            asset_criticality,
+            message
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        event["event_id"],
+        event["timestamp"],
+        event.get("source_type"),
+        event.get("source_ip"),
+        event.get("destination_ip"),
+        event.get("username"),
+        event.get("event_type"),
+        event.get("severity"),
+        event.get("asset_criticality"),
+        event.get("message")
+    ))
+
+    connection.commit()
+    connection.close()
+
+
+def save_incident(incident):
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO incidents (
+            incident_id,
+            correlation_id,
+            incident_type,
+            incident_patterns,
+            incident_title,
+            incident_start,
+            incident_end,
+            source_ip,
+            destination_ip,
+            signal_types,
+            source_types,
+            signal_count,
+            unique_event_count,
+            fusion_strength,
+            risk_score,
+            severity,
+            priority_score,
+            priority_level,
+            queue_rank,
+            recommended_action,
+            canonical_evidence,
+            evidence_hash,
+            integrity_status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        incident["incident_id"],
+        incident["correlation_id"],
+        incident["incident_type"],
+        incident["incident_patterns"],
+        incident["incident_title"],
+        incident["incident_start"],
+        incident["incident_end"],
+        incident["source_ip"],
+        incident.get("destination_ip"),
+        incident["signal_types"],
+        incident["source_types"],
+        incident["signal_count"],
+        incident["unique_event_count"],
+        incident["fusion_strength"],
+        incident["risk_score"],
+        incident["severity"],
+        incident["priority_score"],
+        incident["priority_level"],
+        incident["queue_rank"],
+        incident["recommended_action"],
+        incident["canonical_evidence"],
+        incident["evidence_hash"],
+        incident["integrity_status"]
+    ))
+
+    connection.commit()
+    connection.close()
+
+
+def get_incidents():
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM incidents
+        ORDER BY queue_rank ASC
+    """)
+
+    rows = cursor.fetchall()
+    connection.close()
+
+    return [dict(row) for row in rows]
+
+
+def get_incident(incident_id):
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM incidents
+        WHERE incident_id = ?
+    """, (incident_id,))
+
+    row = cursor.fetchone()
+    connection.close()
+
+    return dict(row) if row else None
+
+auth.py:
+import hashlib
+import secrets
+from pathlib import Path
+import json
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+AUTH_FILE = BASE_DIR / "backend" / "analysts.json"
+
+
+def hash_password(password, salt=None):
+    """
+    Hash a password using PBKDF2-HMAC-SHA256.
+    A random salt is generated for new passwords.
+    """
+
+    if salt is None:
+        salt = secrets.token_hex(16)
+
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        200_000
+    ).hex()
+
+    return salt, password_hash
+
+
+def verify_password(password, salt, stored_hash):
+    """
+    Verify a password against the stored PBKDF2 hash.
+    """
+
+    _, calculated_hash = hash_password(password, salt)
+
+    return secrets.compare_digest(
+        calculated_hash,
+        stored_hash
+    )
+
+
+def create_default_analyst():
+    """
+    Create a default analyst account if one does not exist.
+    """
+
+    if AUTH_FILE.exists():
+        return
+
+    salt, password_hash = hash_password("admin123")
+
+    analysts = {
+        "analyst": {
+            "password_hash": password_hash,
+            "salt": salt,
+            "role": "SOC Analyst"
+        }
+    }
+
+    AUTH_FILE.write_text(
+        json.dumps(analysts, indent=4),
+        encoding="utf-8"
+    )
+
+
+def authenticate(username, password):
+    """
+    Authenticate an analyst.
+    """
+
+    create_default_analyst()
+
+    try:
+        analysts = json.loads(
+            AUTH_FILE.read_text(encoding="utf-8")
+        )
+    except Exception:
+        return False, None
+
+    analyst = analysts.get(username)
+
+    if not analyst:
+        return False, None
+
+    valid = verify_password(
+        password,
+        analyst["salt"],
+        analyst["password_hash"]
+    )
+
+    if valid:
+        return True, {
+            "username": username,
+            "role": analyst.get("role", "SOC Analyst")
+        }
+
+    return False, None
+
+analyst.json:
+{
+    "analyst": {
+        "password_hash": "1472541330559493741f016b5f32285b62c7a8b40c3c15a462622399feb40ae3",
+        "salt": "448767d9e4997ecac398b18bbed62b96",
+        "role": "SOC Analyst"
+    }
+}
+
+app.py:
+import html
+from datetime import datetime
+
+import requests
+import streamlit as st
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+API_URL = "http://127.0.0.1:8001"
+CACHE_TTL_SECONDS = 30  # how long incident/summary data is cached before refetching
+
+st.set_page_config(
+    page_title="Signal-Fused SOC",
+    page_icon="◈",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# A shared session gives connection reuse across the many requests calls below.
+_session = requests.Session()
+
+# ============================================================
+# CUSTOM UI STYLE
+# ============================================================
+
+st.markdown(
+    """
+    <style>
+
+    /* --------------------------------------------------------
+       GLOBAL
+    -------------------------------------------------------- */
+
+    .stApp {
+        background: #111517;
+        color: #e7e3d8;
+    }
+
+    .main .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 2rem;
+        max-width: 1500px;
+    }
+
+    html, body, [class*="css"] {
+        font-family: "Segoe UI", sans-serif;
+    }
+
+    /* --------------------------------------------------------
+       SIDEBAR
+    -------------------------------------------------------- */
+
+    section[data-testid="stSidebar"] {
+        background: #0d1113;
+        border-right: 1px solid #263133;
+    }
+
+    section[data-testid="stSidebar"] > div {
+        padding-top: 2rem;
+    }
+
+    .sidebar-brand {
+        padding: 10px 5px 20px 5px;
+        border-bottom: 1px solid #263133;
+        margin-bottom: 20px;
+    }
+
+    .sidebar-brand-title {
+        font-size: 20px;
+        font-weight: 700;
+        color: #e7e3d8;
+        letter-spacing: 0.5px;
+    }
+
+    .sidebar-brand-subtitle {
+        color: #7e9893;
+        font-size: 12px;
+        margin-top: 4px;
+    }
+
+    .status-online {
+        display: inline-block;
+        padding: 4px 9px;
+        border-radius: 12px;
+        background: #183b3b;
+        color: #8bc8bd;
+        font-size: 11px;
+        font-weight: 600;
+        margin-top: 12px;
+    }
+
+    /* --------------------------------------------------------
+       HEADER
+    -------------------------------------------------------- */
+
+    .soc-header {
+        background: #171d1f;
+        border: 1px solid #293638;
+        border-radius: 14px;
+        padding: 22px 26px;
+        margin-bottom: 22px;
+    }
+
+    .soc-title {
+        font-size: 28px;
+        font-weight: 700;
+        color: #e7e3d8;
+        letter-spacing: -0.5px;
+    }
+
+    .soc-subtitle {
+        font-size: 13px;
+        color: #8ca19d;
+        margin-top: 5px;
+    }
+
+    .analyst-box {
+        text-align: right;
+        padding-top: 3px;
+    }
+
+    .analyst-name {
+        font-weight: 700;
+        color: #e7e3d8;
+        font-size: 14px;
+    }
+
+    .analyst-role {
+        color: #829692;
+        font-size: 11px;
+        margin-top: 3px;
+    }
+
+    /* --------------------------------------------------------
+       KPI CARDS
+    -------------------------------------------------------- */
+
+    .kpi-card {
+        background: #171d1f;
+        border: 1px solid #293638;
+        border-radius: 12px;
+        padding: 18px 19px;
+        min-height: 118px;
+        margin-bottom: 8px;
+    }
+
+    .kpi-label {
+        color: #829692;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 1px;
+        font-weight: 600;
+    }
+
+    .kpi-value {
+        color: #e7e3d8;
+        font-size: 31px;
+        font-weight: 700;
+        margin-top: 8px;
+    }
+
+    .kpi-note {
+        color: #71827f;
+        font-size: 11px;
+        margin-top: 3px;
+    }
+
+    .kpi-critical {
+        border-left: 4px solid #a95757;
+    }
+
+    .kpi-high {
+        border-left: 4px solid #b68a4a;
+    }
+
+    .kpi-p1 {
+        border-left: 4px solid #8bc8bd;
+    }
+
+    .kpi-risk {
+        border-left: 4px solid #7fa7a1;
+    }
+
+    .kpi-total {
+        border-left: 4px solid #647775;
+    }
+
+    /* --------------------------------------------------------
+       SECTION HEADERS
+    -------------------------------------------------------- */
+
+    .section-title {
+        font-size: 16px;
+        font-weight: 700;
+        color: #e7e3d8;
+        margin-top: 8px;
+        margin-bottom: 4px;
+    }
+
+    .section-subtitle {
+        font-size: 11px;
+        color: #71827f;
+        margin-bottom: 14px;
+    }
+
+    /* --------------------------------------------------------
+       PANELS
+    -------------------------------------------------------- */
+
+    .panel {
+        background: #171d1f;
+        border: 1px solid #293638;
+        border-radius: 12px;
+        padding: 18px;
+        margin-bottom: 16px;
+    }
+
+    .panel-title {
+        color: #e7e3d8;
+        font-weight: 700;
+        font-size: 14px;
+        margin-bottom: 5px;
+    }
+
+    .panel-subtitle {
+        color: #71827f;
+        font-size: 11px;
+    }
+
+    /* --------------------------------------------------------
+       INCIDENT BADGES
+    -------------------------------------------------------- */
+
+    .badge-critical {
+        display: inline-block;
+        background: #3b2325;
+        color: #d88b8b;
+        border: 1px solid #714344;
+        border-radius: 5px;
+        padding: 3px 8px;
+        font-size: 10px;
+        font-weight: 700;
+    }
+
+    .badge-high {
+        display: inline-block;
+        background: #3b3020;
+        color: #d3ad70;
+        border: 1px solid #705c37;
+        border-radius: 5px;
+        padding: 3px 8px;
+        font-size: 10px;
+        font-weight: 700;
+    }
+
+    .badge-medium {
+        display: inline-block;
+        background: #303329;
+        color: #c2c58f;
+        border: 1px solid #5a6043;
+        border-radius: 5px;
+        padding: 3px 8px;
+        font-size: 10px;
+        font-weight: 700;
+    }
+
+    .badge-low {
+        display: inline-block;
+        background: #202e2c;
+        color: #8bb6ae;
+        border: 1px solid #3c625c;
+        border-radius: 5px;
+        padding: 3px 8px;
+        font-size: 10px;
+        font-weight: 700;
+    }
+
+    /* --------------------------------------------------------
+       INCIDENT DETAIL
+    -------------------------------------------------------- */
+
+    .detail-card {
+        background: #141a1c;
+        border: 1px solid #2a383a;
+        border-radius: 10px;
+        padding: 14px;
+        margin-bottom: 10px;
+    }
+
+    .detail-label {
+        color: #71827f;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.8px;
+    }
+
+    .detail-value {
+        color: #ddd9ce;
+        font-size: 13px;
+        margin-top: 4px;
+        word-break: break-word;
+    }
+
+    /* --------------------------------------------------------
+       BUTTONS
+    -------------------------------------------------------- */
+
+    .stButton > button {
+        border-radius: 8px;
+        border: 1px solid #36504d;
+        background: #183b3b;
+        color: #dce9e5;
+        font-weight: 600;
+    }
+
+    .stButton > button:hover {
+        border-color: #5f9188;
+        background: #204848;
+        color: #ffffff;
+    }
+
+    /* --------------------------------------------------------
+       SELECTBOX / INPUT
+    -------------------------------------------------------- */
+
+    div[data-baseweb="select"] > div {
+        background: #141a1c;
+        border-color: #334345;
+    }
+
+    div[data-baseweb="input"] > div {
+        background: #141a1c;
+        border-color: #334345;
+    }
+
+    /* --------------------------------------------------------
+       DATAFRAME
+    -------------------------------------------------------- */
+
+    div[data-testid="stDataFrame"] {
+        border: 1px solid #293638;
+        border-radius: 10px;
+        overflow: hidden;
+    }
+
+
+
+    div[data-testid="stProgress"] > div > div > div {
+        background: #5e928a;
+    }
+
+
+
+    .login-wrapper {
+        max-width: 470px;
+        margin: 90px auto 0 auto;
+        background: #171d1f;
+        border: 1px solid #293638;
+        border-radius: 16px;
+        padding: 35px;
+    }
+
+    .login-logo {
+        text-align: center;
+        font-size: 38px;
+        color: #8bc8bd;
+    }
+
+    .login-title {
+        text-align: center;
+        font-size: 26px;
+        font-weight: 700;
+        color: #e7e3d8;
+        margin-top: 10px;
+    }
+
+    .login-subtitle {
+        text-align: center;
+        color: #829692;
+        font-size: 12px;
+        margin-top: 6px;
+        margin-bottom: 25px;
+    }
+
+
+
+    .footer {
+        text-align: center;
+        color: #526360;
+        font-size: 10px;
+        padding: 20px 0 5px 0;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+
+
+
+def safe_float(value, default=0.0):
+    """Best-effort float conversion. Never raises."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value, default=0):
+    """Best-effort int conversion (routes through float first to tolerate '5.0')."""
+    return int(safe_float(value, default))
+
+
+def esc(value) -> str:
+    """HTML-escape any value before interpolating it into unsafe_allow_html markup."""
+    return html.escape(str(value)) if value is not None else ""
+
+
+
+
+class AuthError(Exception):
+    """Raised when the backend reachable but credentials are rejected."""
+
+
+class BackendUnavailable(Exception):
+    """Raised when the backend cannot be reached at all (network/timeout)."""
+
+
+def authenticate(username: str, password: str) -> dict:
+    """
+    Returns the login payload on success.
+    Raises AuthError for a rejected login (so the UI can show a precise message)
+    and BackendUnavailable for connection/timeout problems, instead of collapsing
+    every possible failure into one generic message.
+    """
+    try:
+        response = _session.post(
+            f"{API_URL}/api/auth/login",
+            json={"username": username, "password": password},
+            timeout=5
+        )
+    except requests.exceptions.RequestException as exc:
+        raise BackendUnavailable(str(exc)) from exc
+
+    if response.status_code == 200:
+        payload = response.json()
+        if payload.get("authenticated"):
+            return payload
+        raise AuthError("Invalid Analyst ID or Password.")
+
+    if response.status_code in (401, 403):
+        raise AuthError("Invalid Analyst ID or Password.")
+
+    raise BackendUnavailable(f"Backend returned HTTP {response.status_code}.")
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def get_summary() -> dict:
+    response = _session.get(f"{API_URL}/api/dashboard/summary", timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def get_incidents() -> list:
+    response = _session.get(f"{API_URL}/api/incidents", timeout=15)
+    response.raise_for_status()
+    data = response.json()
+
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("incidents", [])
+    return []
+
+
+def verify_integrity(incident_id: str) -> dict:
+    response = _session.get(f"{API_URL}/api/trust/{incident_id}/verify", timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
+
+
+st.session_state.setdefault("authenticated", False)
+st.session_state.setdefault("analyst", None)
+
+
+
+
+if not st.session_state.authenticated:
+
+    st.markdown(
+        """
+        <div class="login-wrapper">
+            <div class="login-logo">◈</div>
+            <div class="login-title">Signal-Fused SOC</div>
+            <div class="login-subtitle">
+                Multi-source threat correlation & evidence intelligence
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    login_col1, login_col2, login_col3 = st.columns([1, 2, 1])
+
+    with login_col2:
+        # A real form lets the analyst hit Enter in the password field to submit,
+        # instead of forcing a click on a separate button.
+        with st.form("login_form", clear_on_submit=False):
+            username = st.text_input("Analyst ID", placeholder="Enter analyst ID")
+            password = st.text_input("Password", type="password", placeholder="Enter password")
+            login_button = st.form_submit_button("SIGN IN TO SOC", use_container_width=True)
+
+        if login_button:
+            if not username or not password:
+                st.error("Please enter Analyst ID and Password.")
+            else:
+                try:
+                    result = authenticate(username, password)
+                    st.session_state.authenticated = True
+                    st.session_state.analyst = result.get("analyst", {})
+                    st.rerun()
+                except AuthError:
+                    st.error("Invalid Analyst ID or Password.")
+                except BackendUnavailable as exc:
+                    st.error(f"Unable to reach the SOC backend at {API_URL}. ({exc})")
+
+    st.stop()
+
+
+
+
+try:
+    summary = get_summary()
+    incidents = get_incidents()
+except Exception as error:
+    st.error(f"Unable to connect to SOC backend: {error}")
+    st.stop()
+
+
+
+analyst = st.session_state.analyst or {}
+analyst_username = analyst.get("username", "Analyst")
+analyst_role = analyst.get("role", "SOC Analyst")
+
+
+with st.sidebar:
+
+    st.markdown(
+        """
+        <div class="sidebar-brand">
+            <div class="sidebar-brand-title">◈ SIGNAL-FUSED</div>
+            <div class="sidebar-brand-subtitle">Security Operations Console</div>
+            <span class="status-online">● SYSTEM ONLINE</span>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    st.markdown("### Analyst")
+    st.write(f"**{analyst_username}**")
+    st.caption(analyst_role)
+
+    st.divider()
+
+    st.markdown("### System")
+    st.caption(f"Incidents loaded: {len(incidents):,}")
+    st.caption("Backend: FastAPI")
+    st.caption("Storage: SQLite")
+    st.caption("Evidence: SHA-256")
+
+    st.divider()
+
+    if st.button("↻ Refresh Data", use_container_width=True):
+        # Data is cached for CACHE_TTL_SECONDS, so an explicit refresh needs to
+        # drop the cache before rerunning, otherwise it just redisplays stale data.
+        get_summary.clear()
+        get_incidents.clear()
+        st.rerun()
+
+    if st.button("Logout", use_container_width=True):
+        st.session_state.authenticated = False
+        st.session_state.analyst = None
+        st.rerun()
+
+
+
+header_col1, header_col2 = st.columns([4, 1])
+
+with header_col1:
+    st.markdown(
+        """
+        <div class="soc-header">
+            <div class="soc-title">Security Operations Dashboard</div>
+            <div class="soc-subtitle">
+                Multi-source intrusion detection,
+                signal fusion, risk prioritization
+                and cryptographic evidence trust
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with header_col2:
+    st.markdown(
+        f"""
+        <div class="analyst-box">
+            <div class="analyst-name">{esc(analyst_username)}</div>
+            <div class="analyst-role">{esc(analyst_role)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+
+# Backend returns nested dictionaries:
+#   summary["severity"]["CRITICAL"]
+#   summary["priority"]["P1"]
+#   summary["integrity"]["VERIFIED"]
+
+severity_summary = summary.get("severity", {})
+priority_summary = summary.get("priority", {})
+integrity_summary = summary.get("integrity", {})
+
+total_incidents = safe_int(summary.get("total_incidents", len(incidents)))
+
+critical = safe_int(severity_summary.get("CRITICAL", 0))
+high = safe_int(severity_summary.get("HIGH", 0))
+medium = safe_int(severity_summary.get("MEDIUM", 0))
+low = safe_int(severity_summary.get("LOW", 0))
+
+p1 = safe_int(priority_summary.get("P1", 0))
+p2 = safe_int(priority_summary.get("P2", 0))
+p3 = safe_int(priority_summary.get("P3", 0))
+p4 = safe_int(priority_summary.get("P4", 0))
+
+verified = safe_int(integrity_summary.get("VERIFIED", 0))
+tampered = safe_int(integrity_summary.get("TAMPERED", 0))
+other_integrity = safe_int(integrity_summary.get("OTHER", 0))
+
+
+
+
+risk_values = []
+unparsed_risk_count = 0
+
+for incident in incidents:
+    raw_risk = incident.get("risk_score")
+    if raw_risk is None:
+        unparsed_risk_count += 1
+        continue
+    try:
+        risk_values.append(float(raw_risk))
+    except (TypeError, ValueError):
+        unparsed_risk_count += 1
+
+if risk_values:
+    average_risk = sum(risk_values) / len(risk_values)
+    maximum_risk = max(risk_values)
+    high_risk_count = sum(1 for r in risk_values if r >= 70)
+else:
+    average_risk = 0
+    maximum_risk = 0
+    high_risk_count = 0
+
+# Denominator matches the numerator's population (parsed risk scores only),
+# so the percentage stays mathematically consistent even if some incidents
+# have a missing/malformed risk_score.
+risk_rate = (high_risk_count / len(risk_values)) * 100 if risk_values else 0
+
+
+
+
+st.markdown('<div class="section-title">Operational Overview</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-subtitle">Current incident and analyst workload indicators</div>',
+    unsafe_allow_html=True
+)
+
+k1, k2, k3, k4, k5 = st.columns(5)
+
+with k1:
+    st.markdown(
+        f"""
+        <div class="kpi-card kpi-total">
+            <div class="kpi-label">Total Incidents</div>
+            <div class="kpi-value">{total_incidents:,}</div>
+            <div class="kpi-note">Correlated security incidents</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with k2:
+    st.markdown(
+        f"""
+        <div class="kpi-card kpi-critical">
+            <div class="kpi-label">Critical</div>
+            <div class="kpi-value">{critical:,}</div>
+            <div class="kpi-note">Severity: CRITICAL</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with k3:
+    st.markdown(
+        f"""
+        <div class="kpi-card kpi-high">
+            <div class="kpi-label">High</div>
+            <div class="kpi-value">{high:,}</div>
+            <div class="kpi-note">Severity: HIGH</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with k4:
+    st.markdown(
+        f"""
+        <div class="kpi-card kpi-p1">
+            <div class="kpi-label">P1 Queue</div>
+            <div class="kpi-value">{p1:,}</div>
+            <div class="kpi-note">Immediate analyst attention</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+with k5:
+    st.markdown(
+        f"""
+        <div class="kpi-card kpi-risk">
+            <div class="kpi-label">Risk Rate</div>
+            <div class="kpi-value">{risk_rate:.1f}%</div>
+            <div class="kpi-note">Incidents with risk ≥ 70</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+
+
+st.write("")
+
+ov1, ov2, ov3, ov4 = st.columns(4)
+
+with ov1:
+    st.metric("Medium", f"{medium:,}")
+
+with ov2:
+    st.metric("Low", f"{low:,}")
+
+with ov3:
+    st.metric("Average Risk", f"{average_risk:.1f}/100")
+
+with ov4:
+    st.metric("Maximum Risk", f"{maximum_risk:.1f}/100")
+
+if unparsed_risk_count:
+    st.caption(f"Note: {unparsed_risk_count:,} incident(s) had a missing/invalid risk_score and were excluded from the risk statistics above.")
+
+
+
+
+st.markdown('<div class="section-title">Threat Distribution</div>', unsafe_allow_html=True)
+
+dist_col1, dist_col2 = st.columns(2)
+
+with dist_col1:
+    st.markdown(
+        """
+        <div class="panel">
+            <div class="panel-title">Severity Distribution</div>
+            <div class="panel-subtitle">Incidents grouped by calculated severity</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    severity_chart = {"Critical": critical, "High": high, "Medium": medium, "Low": low}
+    st.bar_chart(severity_chart, height=250)
+
+with dist_col2:
+    st.markdown(
+        """
+        <div class="panel">
+            <div class="panel-title">Analyst Priority Distribution</div>
+            <div class="panel-subtitle">Queue classification generated by the prioritization layer</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+    priority_chart = {"P1": p1, "P2": p2, "P3": p3, "P4": p4}
+    st.bar_chart(priority_chart, height=250)
+
+
+
+
+st.markdown('<div class="section-title">Authentication Activity</div>', unsafe_allow_html=True)
+
+auth_events = []
+
+for incident in incidents:
+    signals = str(incident.get("signal_types", "")).upper()
+
+    if "AUTH_FAILURE_SIGNAL" in signals or "BRUTE_FORCE_SIGNAL" in signals:
+        auth_events.append({
+            "Source IP": incident.get("source_ip", "-"),
+            "Incident": incident.get("incident_id", "-"),
+            "Severity": incident.get("severity", "-"),
+            "Priority": incident.get("priority_level", "-"),
+            "Risk": incident.get("risk_score", "-"),
+            "Status": "Suspicious authentication activity"
+        })
+
+if auth_events:
+    st.dataframe(auth_events[:20], use_container_width=True, hide_index=True)
+
+    if len(auth_events) > 20:
+        st.caption(f"Showing first 20 of {len(auth_events):,} authentication-related incidents.")
+else:
+    st.info("No authentication-related incidents currently detected.")
+
+
+
+
+st.markdown('<div class="section-title">Analyst Priority Queue</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="section-subtitle">Incidents ordered according to the generated SOC queue rank</div>',
+    unsafe_allow_html=True
+)
+
+# safe_float means a malformed/missing queue_rank (e.g. "N/A", "", None) sorts
+# to the bottom instead of crashing the whole page.
+priority_incidents = sorted(
+    incidents,
+    key=lambda x: safe_float(x.get("queue_rank"), default=999_999)
+)
+
+if priority_incidents:
+    queue_rows = []
+
+    for incident in priority_incidents[:25]:
+        queue_rows.append({
+            "Rank": incident.get("queue_rank", "-"),
+            "Priority": incident.get("priority_level", "-"),
+            "Severity": incident.get("severity", "-"),
+            "Risk": incident.get("risk_score", "-"),
+            "Incident": incident.get("incident_id", "-"),
+            "Source IP": incident.get("source_ip", "-"),
+            "Pattern": incident.get("incident_patterns", "-")
+        })
+
+    st.dataframe(queue_rows, use_container_width=True, hide_index=True)
+else:
+    st.info("No prioritized incidents available.")
+
+
+
+st.markdown('<div class="section-title">Incident Investigation</div>', unsafe_allow_html=True)
+
+if incidents:
+    incident_ids = [
+        incident.get("incident_id")
+        for incident in incidents
+        if incident.get("incident_id")
+    ]
+
+    selected_incident_id = st.selectbox(
+        "Select incident",
+        incident_ids,
+        key="incident_investigation_select"
+    )
+
+    selected = next(
+        (x for x in incidents if x.get("incident_id") == selected_incident_id),
+        None
+    )
+
+    if selected:
+
+        # ----------------------------------------------------
+        # TOP INCIDENT METRICS
+        # ----------------------------------------------------
+
+        d1, d2, d3, d4 = st.columns(4)
+
+        with d1:
+            st.metric("Risk Score", selected.get("risk_score", "-"))
+
+        with d2:
+            st.metric("Severity", selected.get("severity", "-"))
+
+        with d3:
+            st.metric("Priority", selected.get("priority_level", "-"))
+
+        with d4:
+            st.metric("Fusion Strength", selected.get("fusion_strength", "-"))
+
+
+        info1, info2 = st.columns(2)
+
+        with info1:
+            st.markdown(
+                """
+                <div class="panel">
+                    <div class="panel-title">Incident Identity</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            st.write(f"**Incident ID:** {selected.get('incident_id', '-')}")
+            st.write(f"**Correlation ID:** {selected.get('correlation_id', '-')}")
+            st.write(f"**Source IP:** {selected.get('source_ip', '-')}")
+            st.write(f"**Destination IP:** {selected.get('destination_ip', '-')}")
+            st.write(f"**Incident Type:** {selected.get('incident_type', '-')}")
+
+        with info2:
+            st.markdown(
+                """
+                <div class="panel">
+                    <div class="panel-title">Incident Timing & Volume</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+            duration = selected.get("duration_seconds")
+            duration_display = f"{duration} seconds" if duration not in (None, "") else "-"
+
+            st.write(f"**Events:** {selected.get('unique_event_count', '-')}")
+            st.write(f"**Signals:** {selected.get('signal_count', '-')}")
+            st.write(f"**Duration:** {duration_display}")
+            st.write(f"**Start:** {selected.get('incident_start', '-')}")
+            st.write(f"**End:** {selected.get('incident_end', '-')}")
+
+
+        st.markdown("#### Detected Signals")
+
+        signal_text = str(selected.get("signal_types", ""))
+        signal_list = [x.strip() for x in signal_text.replace("|", ",").split(",") if x.strip()]
+
+        if signal_list:
+            signal_columns = st.columns(min(len(signal_list), 4))
+
+            for index, signal in enumerate(signal_list):
+                with signal_columns[index % len(signal_columns)]:
+                    st.markdown(
+                        f"""
+                        <div class="detail-card">
+                            <div class="detail-label">Signal</div>
+                            <div class="detail-value">{esc(signal)}</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True
+                    )
+        else:
+            st.info("No signal information available.")
+
+
+
+        st.markdown("#### Correlation & Fusion")
+
+        patterns = str(selected.get("incident_patterns", ""))
+        pattern_list = [x.strip() for x in patterns.replace("|", ",").split(",") if x.strip()]
+
+        if pattern_list:
+            for pattern in pattern_list:
+                st.info(f"Fusion Pattern: **{pattern}**")
+
+     
+
+        ev1, ev2, ev3, ev4 = st.columns(4)
+
+        with ev1:
+            st.metric("Fusion Evidence", selected.get("fusion_evidence_count", "-"))
+
+        with ev2:
+            st.metric("Signal Diversity", selected.get("unique_signal_type_count", "-"))
+
+        with ev3:
+            st.metric("Source Diversity", selected.get("unique_source_type_count", "-"))
+
+        with ev4:
+            st.metric("Mean Signal Strength", selected.get("mean_signal_strength", "-"))
+
+   
+
+        st.markdown("#### Risk Assessment")
+
+        selected_risk = safe_float(selected.get("risk_score"), default=0.0)
+
+        st.progress(min(max(selected_risk / 100, 0), 1))
+        st.write(f"Risk Score: **{selected_risk:.2f}/100**")
+        st.write(f"Severity: **{selected.get('severity', '-')}**")
+
+        if selected.get("risk_factors"):
+            st.write(f"Risk Factors: **{selected.get('risk_factors')}**")
+
+        if selected.get("severity_reason"):
+            st.write(f"Severity Reason: **{selected.get('severity_reason')}**")
+
+   
+
+        st.markdown("#### Recommended Analyst Response")
+        st.warning(selected.get("recommended_action", "INVESTIGATE"))
+
+
+
+        st.markdown("#### Cryptographic Trust Layer")
+
+        trust1, trust2 = st.columns(2)
+
+        with trust1:
+            st.write("**Integrity Status:**")
+
+            integrity_status = selected.get("integrity_status", "-")
+
+            if integrity_status == "INTEGRITY_VERIFIED":
+                st.success("✓ INTEGRITY VERIFIED")
+            elif integrity_status == "TAMPERING_DETECTED":
+                st.error("⚠ POSSIBLE TAMPERING DETECTED")
+            else:
+                st.warning(f"Status: {integrity_status}")
+
+        with trust2:
+            st.write(f"**Hash Algorithm:** {selected.get('hash_algorithm', 'SHA-256')}")
+            st.write(f"**Evidence Version:** {selected.get('evidence_version', '-')}")
+
+        stored_hash = selected.get("evidence_hash", "-")
+
+        st.write("**Stored SHA-256 Hash:**")
+        st.code(stored_hash)
+
+        verify_button = st.button("VERIFY EVIDENCE INTEGRITY", use_container_width=True)
+
+        if verify_button:
+            try:
+                result = verify_integrity(selected_incident_id)
+                status = result.get("integrity_status")
+                calculated_hash = result.get("calculated_hash", "-")
+
+                st.write("**Calculated SHA-256 Hash:**")
+                st.code(calculated_hash)
+
+                if status == "INTEGRITY_VERIFIED":
+                    st.success("✓ INTEGRITY VERIFIED — Stored evidence matches its SHA-256 hash.")
+                elif status == "TAMPERING_DETECTED":
+                    st.error("⚠ POSSIBLE TAMPERING DETECTED — Stored and calculated hashes do not match.")
+                else:
+                    st.warning(f"Integrity status: {status}")
+
+            except Exception as error:
+                st.error(f"Verification failed: {error}")
+
+ 
+
+        with st.expander("View Canonical Evidence"):
+            st.code(selected.get("canonical_evidence", "No evidence available."), language="text")
+
+else:
+    st.info("No incidents are available for investigation.")
+
+
+
+
+st.markdown('<div class="section-title">Evidence Integrity</div>', unsafe_allow_html=True)
+
+integrity_col1, integrity_col2, integrity_col3 = st.columns(3)
+
+with integrity_col1:
+    st.metric("Verified", f"{verified:,}")
+
+with integrity_col2:
+    st.metric("Possible Tampering", f"{tampered:,}")
+
+with integrity_col3:
+    st.metric("Evidence Records", f"{len(incidents):,}")
+
+if tampered > 0:
+    st.error(f"⚠ {tampered:,} incident(s) have possible evidence-integrity violations.")
+else:
+    st.success("✓ No evidence-integrity violations currently recorded.")
+    
+st.markdown(
+    f"""
+    <div class="footer">
+        SIGNAL-FUSED SOC · Multi-source threat correlation
+        · Evidence fusion · Risk prioritization · SHA-256 trust
+        <br><br>
+        Last refreshed: {esc(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))}
+    </div>
+    """,
+    unsafe_allow_html=True
+)

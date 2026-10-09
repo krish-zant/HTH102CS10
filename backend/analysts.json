@@ -1,0 +1,7 @@
+{
+    "analyst": {
+        "password_hash": "1472541330559493741f016b5f32285b62c7a8b40c3c15a462622399feb40ae3",
+        "salt": "448767d9e4997ecac398b18bbed62b96",
+        "role": "SOC Analyst"
+    }
+}
